@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/daulet/tokenizers"
@@ -18,11 +19,22 @@ var (
 	ModelName     = "bge-base-zh-int8"
 	APIModelID    = "bge-base-zh-int8"
 	MaxLength     = 512
-	MaxBatch      = 1 // 模型固化 shape=[1,512]，单条推理；多条请求循环发起
+	MaxBatch      = 1 // 模型固化 shape=[1,512]，单条推理；多条请求并发发起
+	MaxParallel   = 4 // 并发调用 OVMS 的最大 goroutine 数，应 <= config.json 里的 nireq
 	ListenAddr    = "0.0.0.0:8000"
 	TokenizerPath = `E:\R\AI\ovms\models\bge-base-zh-int8\1\tokenizer.json`
 	Device        = "NPU"
 )
+
+// httpClient 复用 TCP 连接，避免每次 request 都握手；并发场景下必开。
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 type EmbeddingRequest struct {
 	Input interface{} `json:"input"`
@@ -119,7 +131,7 @@ func callOVMS(inputIDs, attentionMask, tokenTypeIDs [][]int64) ([][][]float32, e
 	body, _ := json.Marshal(payload)
 	url := fmt.Sprintf("%s/v1/models/%s:predict", OVMSBaseURL, ModelName)
 
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("OVMS call failed: %v", err)
 	}
@@ -241,44 +253,67 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	N := len(texts)
 	t0 := time.Now()
 
-	// 模型固化 shape=[MaxBatch, MaxLength]，MaxBatch=1，每条循环单发。
+	// 模型固化 shape=[MaxBatch, MaxLength]，MaxBatch=1；多条时并发，最多 MaxParallel。
 	data := make([]EmbeddingData, N)
-	totalTokens := 0
-	for i, text := range texts {
-		ids, _, err := tk.EncodeErr(text, true)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"tokenize failed: %s"}`, err.Error()), 500)
+	tokenCounts := make([]int, N)
+	errs := make([]error, N)
+
+	sem := make(chan struct{}, MaxParallel)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, text string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			ids, _, err := tk.EncodeErr(text, true)
+			if err != nil {
+				errs[idx] = fmt.Errorf("tokenize failed: %v", err)
+				return
+			}
+			if len(ids) > MaxLength {
+				ids = ids[:MaxLength]
+			}
+
+			inputIDs := make([][]int64, MaxBatch)
+			attentionMask := make([][]int64, MaxBatch)
+			tokenTypeIDs := make([][]int64, MaxBatch)
+			inputIDs[0] = make([]int64, MaxLength)
+			attentionMask[0] = make([]int64, MaxLength)
+			tokenTypeIDs[0] = make([]int64, MaxLength)
+			for j, id := range ids {
+				inputIDs[0][j] = int64(id)
+				attentionMask[0][j] = 1
+			}
+			tokenCounts[idx] = len(ids)
+
+			lastHidden, err := callOVMS(inputIDs, attentionMask, tokenTypeIDs)
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+
+			pooled := meanPooling(lastHidden, attentionMask)
+			emb := l2Normalize(pooled)[0]
+			data[idx] = EmbeddingData{Object: "embedding", Embedding: emb, Index: idx}
+		}(i, texts[i])
+	}
+	wg.Wait()
+
+	for i, e := range errs {
+		if e != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"item %d: %s"}`, i, e.Error()), 500)
 			return
 		}
-		if len(ids) > MaxLength {
-			ids = ids[:MaxLength]
-		}
-
-		inputIDs := make([][]int64, MaxBatch)
-		attentionMask := make([][]int64, MaxBatch)
-		tokenTypeIDs := make([][]int64, MaxBatch)
-		inputIDs[0] = make([]int64, MaxLength)
-		attentionMask[0] = make([]int64, MaxLength)
-		tokenTypeIDs[0] = make([]int64, MaxLength)
-		for j, id := range ids {
-			inputIDs[0][j] = int64(id)
-			attentionMask[0][j] = 1
-			totalTokens++
-		}
-
-		lastHidden, err := callOVMS(inputIDs, attentionMask, tokenTypeIDs)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
-			return
-		}
-
-		pooled := meanPooling(lastHidden, attentionMask)
-		emb := l2Normalize(pooled)[0]
-		data[i] = EmbeddingData{Object: "embedding", Embedding: emb, Index: i}
 	}
 
+	totalTokens := 0
+	for _, c := range tokenCounts {
+		totalTokens += c
+	}
 	elapsed := time.Since(t0).Milliseconds()
-	log.Printf("N=%d tokens=%d time=%dms", N, totalTokens, elapsed)
+	log.Printf("N=%d tokens=%d time=%dms parallel=%d", N, totalTokens, elapsed, MaxParallel)
 
 	resp := EmbeddingResponse{
 		Object: "list",
