@@ -47,15 +47,10 @@ type EmbeddingResponse struct {
 	Usage  Usage           `json:"usage"`
 }
 
+// TFS columnar inputs: {"inputs": {"<name>": [[...]] , ...}}
+// 每个字段值是 [batch][seq] int64 二维数组，OVMS 不再在外面加 batch 维。
 type OVMSRequest struct {
-	Inputs []OVMSTensor `json:"inputs"`
-}
-
-type OVMSTensor struct {
-	Name     string  `json:"name"`
-	Shape    []int   `json:"shape"`
-	Datatype string  `json:"datatype"`
-	Data     []int64 `json:"data"`
+	Inputs map[string][][]int64 `json:"inputs"`
 }
 
 var tk *tokenizers.Tokenizer
@@ -109,26 +104,15 @@ func l2Normalize(vectors [][]float32) [][]float64 {
 }
 
 func callOVMS(inputIDs, attentionMask, tokenTypeIDs [][]int64) ([][][]float32, error) {
-	batch := len(inputIDs)
-	if batch == 0 {
+	if len(inputIDs) == 0 {
 		return nil, fmt.Errorf("batch is 0")
-	}
-	seq := len(inputIDs[0])
-
-	flatInput := make([]int64, 0, batch*seq)
-	flatMask := make([]int64, 0, batch*seq)
-	flatType := make([]int64, 0, batch*seq)
-	for b := 0; b < batch; b++ {
-		flatInput = append(flatInput, inputIDs[b]...)
-		flatMask = append(flatMask, attentionMask[b]...)
-		flatType = append(flatType, tokenTypeIDs[b]...)
 	}
 
 	payload := OVMSRequest{
-		Inputs: []OVMSTensor{
-			{Name: "input_ids", Shape: []int{batch, seq}, Datatype: "INT64", Data: flatInput},
-			{Name: "attention_mask", Shape: []int{batch, seq}, Datatype: "INT64", Data: flatMask},
-			{Name: "token_type_ids", Shape: []int{batch, seq}, Datatype: "INT64", Data: flatType},
+		Inputs: map[string][][]int64{
+			"input_ids":      inputIDs,
+			"attention_mask": attentionMask,
+			"token_type_ids": tokenTypeIDs,
 		},
 	}
 
@@ -158,49 +142,67 @@ func callOVMS(inputIDs, attentionMask, tokenTypeIDs [][]int64) ([][][]float32, e
 		return nil, fmt.Errorf("OVMS response not JSON: %v; body=%s", err, snippet)
 	}
 
-	outputs, ok := result["outputs"].([]interface{})
-	if !ok || len(outputs) == 0 {
-		outputs, ok = result["predictions"].([]interface{})
-		if !ok || len(outputs) == 0 {
-			snippet := string(respBody)
-			if len(snippet) > 512 {
-				snippet = snippet[:512] + "...(truncated)"
-			}
-			return nil, fmt.Errorf("cannot parse OVMS response (no outputs/predictions key); body=%s", snippet)
-		}
-	}
-
-	out0 := outputs[0].(map[string]interface{})
-	dataRaw := out0["data"].([]interface{})
-
-	shapeRaw, ok := out0["shape"].([]interface{})
+	// TFS `inputs`-style 请求，返回是 {"outputs": {"<name>": [[[...]]]}}。
+	// 若模型只有单输出，OVMS 有时会直接返回 {"outputs": [[[...]]]}（三维数组）。
+	// 两种都兼容：先尝试按 map 取 last_hidden_state，失败再按裸数组解析。
+	rawOutputs, ok := result["outputs"]
 	if !ok {
-		return parseFlatData(dataRaw, batch, 1, 768)
+		snippet := string(respBody)
+		if len(snippet) > 512 {
+			snippet = snippet[:512] + "...(truncated)"
+		}
+		return nil, fmt.Errorf("cannot parse OVMS response (no outputs key); body=%s", snippet)
 	}
 
-	shape := make([]int, len(shapeRaw))
-	for i, v := range shapeRaw {
-		shape[i] = int(v.(float64))
+	var hidden3d []interface{}
+	switch v := rawOutputs.(type) {
+	case map[string]interface{}:
+		named, ok := v["last_hidden_state"]
+		if !ok {
+			// 若模型输出名不同，取第一个 value
+			for _, val := range v {
+				named = val
+				break
+			}
+		}
+		arr, ok := named.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("outputs.last_hidden_state is not an array")
+		}
+		hidden3d = arr
+	case []interface{}:
+		hidden3d = v
+	default:
+		return nil, fmt.Errorf("outputs is neither map nor array (%T)", v)
 	}
 
-	if len(shape) == 3 {
-		return parseFlatData(dataRaw, shape[0], shape[1], shape[2])
-	}
-	return parseFlatData(dataRaw, batch, 1, 768)
+	return parseNestedHidden(hidden3d)
 }
 
-func parseFlatData(dataRaw []interface{}, batch, seq, dim int) ([][][]float32, error) {
+// parseNestedHidden 把 [][][]float64（JSON any 表示）转成 [batch][seq][dim]float32。
+func parseNestedHidden(raw []interface{}) ([][][]float32, error) {
+	batch := len(raw)
 	result := make([][][]float32, batch)
 	for b := 0; b < batch; b++ {
+		seqArr, ok := raw[b].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("hidden[%d] is not array", b)
+		}
+		seq := len(seqArr)
 		result[b] = make([][]float32, seq)
 		for s := 0; s < seq; s++ {
+			dimArr, ok := seqArr[s].([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("hidden[%d][%d] is not array", b, s)
+			}
+			dim := len(dimArr)
 			result[b][s] = make([]float32, dim)
 			for d := 0; d < dim; d++ {
-				idx := b*seq*dim + s*dim + d
-				if idx >= len(dataRaw) {
-					continue
+				f, ok := dimArr[d].(float64)
+				if !ok {
+					return nil, fmt.Errorf("hidden[%d][%d][%d] is not number", b, s, d)
 				}
-				result[b][s][d] = float32(dataRaw[idx].(float64))
+				result[b][s][d] = float32(f)
 			}
 		}
 	}
@@ -245,11 +247,10 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 
 	t0 := time.Now()
 
+	// 模型编译期固化 shape=[MaxBatch, MaxLength]，输入必须补齐到该维度。
 	// 逐条编码
 	encoded := make([][]uint32, N)
-	maxSeq := 0
 	for i, text := range texts {
-		// 使用 EncodeErr 获取错误返回值
 		ids, _, err := tk.EncodeErr(text, true)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"tokenize failed: %s"}`, err.Error()), 500)
@@ -259,38 +260,21 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			ids = ids[:MaxLength]
 		}
 		encoded[i] = ids
-		if len(ids) > maxSeq {
-			maxSeq = len(ids)
-		}
-	}
-	if maxSeq == 0 {
-		maxSeq = 1
 	}
 
-	inputIDs := make([][]int64, N)
-	attentionMask := make([][]int64, N)
-	tokenTypeIDs := make([][]int64, N)
-
-	for i, ids := range encoded {
-		inputIDs[i] = make([]int64, maxSeq)
-		attentionMask[i] = make([]int64, maxSeq)
-		tokenTypeIDs[i] = make([]int64, maxSeq)
-		for j := 0; j < len(ids); j++ {
-			inputIDs[i][j] = int64(ids[j])
-			attentionMask[i][j] = 1
-		}
-	}
-
-	padCount := B - N
-	if padCount > 0 {
-		for p := 0; p < padCount; p++ {
-			padIDs := make([]int64, maxSeq)
-			padMask := make([]int64, maxSeq)
-			padType := make([]int64, maxSeq)
-			copy(padIDs, inputIDs[0])
-			inputIDs = append(inputIDs, padIDs)
-			attentionMask = append(attentionMask, padMask)
-			tokenTypeIDs = append(tokenTypeIDs, padType)
+	// 全部按固定 [B, MaxLength] 打包；未填充位置 mask=0，pooling 时会跳过。
+	inputIDs := make([][]int64, B)
+	attentionMask := make([][]int64, B)
+	tokenTypeIDs := make([][]int64, B)
+	for i := 0; i < B; i++ {
+		inputIDs[i] = make([]int64, MaxLength)
+		attentionMask[i] = make([]int64, MaxLength)
+		tokenTypeIDs[i] = make([]int64, MaxLength)
+		if i < N {
+			for j := 0; j < len(encoded[i]); j++ {
+				inputIDs[i][j] = int64(encoded[i][j])
+				attentionMask[i][j] = 1
+			}
 		}
 	}
 
@@ -306,7 +290,12 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	data := make([]EmbeddingData, N)
 	totalTokens := 0
 	for i, emb := range embeddings {
-		totalTokens += len(inputIDs[i])
+		// 真实 token 数 = attention_mask 里的 1 的个数
+		for _, m := range attentionMask[i] {
+			if m == 1 {
+				totalTokens++
+			}
+		}
 		data[i] = EmbeddingData{Object: "embedding", Embedding: emb, Index: i}
 	}
 
