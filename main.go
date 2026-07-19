@@ -18,7 +18,7 @@ var (
 	ModelName     = "bge-base-zh-int8"
 	APIModelID    = "bge-base-zh-int8"
 	MaxLength     = 512
-	MaxBatch      = 8
+	MaxBatch      = 1 // 模型固化 shape=[1,512]，单条推理；多条请求循环发起
 	ListenAddr    = "0.0.0.0:8000"
 	TokenizerPath = `E:\R\AI\ovms\models\bge-base-zh-int8\1\tokenizer.json`
 	Device        = "NPU"
@@ -239,17 +239,11 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	N := len(texts)
-	B := MaxBatch
-	if N > B {
-		http.Error(w, fmt.Sprintf(`{"error":"max batch %d"}`, B), http.StatusBadRequest)
-		return
-	}
-
 	t0 := time.Now()
 
-	// 模型编译期固化 shape=[MaxBatch, MaxLength]，输入必须补齐到该维度。
-	// 逐条编码
-	encoded := make([][]uint32, N)
+	// 模型固化 shape=[MaxBatch, MaxLength]，MaxBatch=1，每条循环单发。
+	data := make([]EmbeddingData, N)
+	totalTokens := 0
 	for i, text := range texts {
 		ids, _, err := tk.EncodeErr(text, true)
 		if err != nil {
@@ -259,48 +253,32 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		if len(ids) > MaxLength {
 			ids = ids[:MaxLength]
 		}
-		encoded[i] = ids
-	}
 
-	// 全部按固定 [B, MaxLength] 打包；未填充位置 mask=0，pooling 时会跳过。
-	inputIDs := make([][]int64, B)
-	attentionMask := make([][]int64, B)
-	tokenTypeIDs := make([][]int64, B)
-	for i := 0; i < B; i++ {
-		inputIDs[i] = make([]int64, MaxLength)
-		attentionMask[i] = make([]int64, MaxLength)
-		tokenTypeIDs[i] = make([]int64, MaxLength)
-		if i < N {
-			for j := 0; j < len(encoded[i]); j++ {
-				inputIDs[i][j] = int64(encoded[i][j])
-				attentionMask[i][j] = 1
-			}
+		inputIDs := make([][]int64, MaxBatch)
+		attentionMask := make([][]int64, MaxBatch)
+		tokenTypeIDs := make([][]int64, MaxBatch)
+		inputIDs[0] = make([]int64, MaxLength)
+		attentionMask[0] = make([]int64, MaxLength)
+		tokenTypeIDs[0] = make([]int64, MaxLength)
+		for j, id := range ids {
+			inputIDs[0][j] = int64(id)
+			attentionMask[0][j] = 1
+			totalTokens++
 		}
-	}
 
-	lastHidden, err := callOVMS(inputIDs, attentionMask, tokenTypeIDs)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
-		return
-	}
-
-	pooled := meanPooling(lastHidden[:N], attentionMask[:N])
-	embeddings := l2Normalize(pooled)
-
-	data := make([]EmbeddingData, N)
-	totalTokens := 0
-	for i, emb := range embeddings {
-		// 真实 token 数 = attention_mask 里的 1 的个数
-		for _, m := range attentionMask[i] {
-			if m == 1 {
-				totalTokens++
-			}
+		lastHidden, err := callOVMS(inputIDs, attentionMask, tokenTypeIDs)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+			return
 		}
+
+		pooled := meanPooling(lastHidden, attentionMask)
+		emb := l2Normalize(pooled)[0]
 		data[i] = EmbeddingData{Object: "embedding", Embedding: emb, Index: i}
 	}
 
 	elapsed := time.Since(t0).Milliseconds()
-	log.Printf("batch=%d/%d tokens=%d time=%dms", N, B, totalTokens, elapsed)
+	log.Printf("N=%d tokens=%d time=%dms", N, totalTokens, elapsed)
 
 	resp := EmbeddingResponse{
 		Object: "list",
