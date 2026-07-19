@@ -142,14 +142,31 @@ func callOVMS(inputIDs, attentionMask, tokenTypeIDs [][]int64) ([][][]float32, e
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		snippet := string(respBody)
+		if len(snippet) > 512 {
+			snippet = snippet[:512] + "...(truncated)"
+		}
+		return nil, fmt.Errorf("OVMS %s returned HTTP %d: %s", url, resp.StatusCode, snippet)
+	}
 	var result map[string]interface{}
-	json.Unmarshal(respBody, &result)
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		snippet := string(respBody)
+		if len(snippet) > 512 {
+			snippet = snippet[:512] + "...(truncated)"
+		}
+		return nil, fmt.Errorf("OVMS response not JSON: %v; body=%s", err, snippet)
+	}
 
 	outputs, ok := result["outputs"].([]interface{})
 	if !ok || len(outputs) == 0 {
 		outputs, ok = result["predictions"].([]interface{})
 		if !ok || len(outputs) == 0 {
-			return nil, fmt.Errorf("cannot parse OVMS response")
+			snippet := string(respBody)
+			if len(snippet) > 512 {
+				snippet = snippet[:512] + "...(truncated)"
+			}
+			return nil, fmt.Errorf("cannot parse OVMS response (no outputs/predictions key); body=%s", snippet)
 		}
 	}
 
