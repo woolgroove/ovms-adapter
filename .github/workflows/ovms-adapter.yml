@@ -1,0 +1,58 @@
+name: Build Go Adapter
+
+on:
+  workflow_dispatch: # 只有手动点击 Run workflow 才会触发编译
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    - name: Setup Rust (stable, windows-gnu target)
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        target: x86_64-pc-windows-gnu
+
+    - name: Setup MinGW (for CGO on Windows)
+      run: |
+        choco install mingw -y
+        echo "C:\tools\mingw64\bin" >> $env:GITHUB_PATH
+
+    - name: Build libtokenizers.a from source (Windows GNU)
+      shell: pwsh
+      run: |
+        git clone --depth 1 --branch v1.27.0 https://github.com/daulet/tokenizers.git "$env:RUNNER_TEMP/tokenizers-src"
+        Push-Location "$env:RUNNER_TEMP/tokenizers-src"
+        cargo build --release -p tokenizers-ffi --target x86_64-pc-windows-gnu
+        Copy-Item target/x86_64-pc-windows-gnu/release/libtokenizers_ffi.a "$env:GITHUB_WORKSPACE/libtokenizers.a"
+        Pop-Location
+
+    - name: Init Go module
+      run: go mod init ovms-adapter
+
+    - name: Install daulet/tokenizers
+      run: |
+        $env:CGO_ENABLED = "1"
+        $env:CC = "gcc"
+        go get github.com/daulet/tokenizers@v1.27.0
+
+    - name: Build
+      run: |
+        $env:CGO_ENABLED = "1"
+        $env:CC = "gcc"
+        $env:CGO_LDFLAGS = "-L$env:GITHUB_WORKSPACE -lntdll -lws2_32 -luserenv -lbcrypt -ladvapi32 -lsynchronization -lkernel32"
+        go build -v -o ovms-adapter.exe .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ovms-adapter-windows-amd64
+        path: ovms-adapter.exe
