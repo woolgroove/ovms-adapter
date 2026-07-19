@@ -48,7 +48,7 @@ jobs:
       run: |
         $env:CGO_ENABLED = "1"
         $env:CC = "gcc"
-        $env:CGO_LDFLAGS = "-L$env:GITHUB_WORKSPACE -lntdll -lws2_32 -luserenv -lbcrypt -ladvapi32 -lsynchronization -lkernel32"
+        $env:CGO_LDFLAGS = "-L$env:GITHUB_WORKSPACE -static -static-libgcc -static-libstdc++ -lntdll -lws2_32 -luserenv -lbcrypt -ladvapi32 -lsynchronization -lkernel32"
         go build -v -o ovms-adapter.exe .
 
     - name: Upload artifact
