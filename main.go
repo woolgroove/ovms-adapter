@@ -65,7 +65,17 @@ type OVMSRequest struct {
 	Inputs map[string][][]int64 `json:"inputs"`
 }
 
+// OVMS TFS 响应：单输出场景就是 map[输出名] -> [batch][seq][dim] float32。
+// 静态类型 unmarshal 避免 map[string]interface{} 的 39 万次装箱。
+type ovmsResponse struct {
+	Outputs map[string][][][]float32 `json:"outputs"`
+}
+
 var tk *tokenizers.Tokenizer
+
+// zeroTypeIDs 是所有请求共享的 token_type_ids（BGE 单句场景永远全 0）。
+// 只读，goroutine 安全；JSON 序列化不会修改它。
+var zeroTypeIDs []int64
 
 func meanPooling(hidden [][][]float32, mask [][]int64) [][]float32 {
 	batch := len(hidden)
@@ -78,18 +88,23 @@ func meanPooling(hidden [][][]float32, mask [][]int64) [][]float32 {
 	for b := 0; b < batch; b++ {
 		result[b] = make([]float32, dim)
 		var count float32 = 0
+		mb := mask[b]
+		hb := hidden[b]
+		// mask 布局固定为前 K 个 1 后面全 0，遇到 0 直接跳出，避免扫完 512。
 		for s := 0; s < seq; s++ {
-			if s >= len(mask[b]) || mask[b][s] == 0 {
-				continue
+			if s >= len(mb) || mb[s] == 0 {
+				break
 			}
 			count++
+			hs := hb[s]
 			for d := 0; d < dim; d++ {
-				result[b][d] += hidden[b][s][d]
+				result[b][d] += hs[d]
 			}
 		}
 		if count > 0 {
+			inv := 1.0 / count
 			for d := 0; d < dim; d++ {
-				result[b][d] /= count
+				result[b][d] *= inv
 			}
 		}
 	}
@@ -145,80 +160,26 @@ func callOVMS(inputIDs, attentionMask, tokenTypeIDs [][]int64) ([][][]float32, e
 		}
 		return nil, fmt.Errorf("OVMS %s returned HTTP %d: %s", url, resp.StatusCode, snippet)
 	}
-	var result map[string]interface{}
-	if err := json.Unmarshal(respBody, &result); err != nil {
+
+	var parsed ovmsResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		snippet := string(respBody)
 		if len(snippet) > 512 {
 			snippet = snippet[:512] + "...(truncated)"
 		}
 		return nil, fmt.Errorf("OVMS response not JSON: %v; body=%s", err, snippet)
 	}
-
-	// TFS `inputs`-style 请求，返回是 {"outputs": {"<name>": [[[...]]]}}。
-	// 若模型只有单输出，OVMS 有时会直接返回 {"outputs": [[[...]]]}（三维数组）。
-	// 两种都兼容：先尝试按 map 取 last_hidden_state，失败再按裸数组解析。
-	rawOutputs, ok := result["outputs"]
-	if !ok {
-		snippet := string(respBody)
-		if len(snippet) > 512 {
-			snippet = snippet[:512] + "...(truncated)"
-		}
-		return nil, fmt.Errorf("cannot parse OVMS response (no outputs key); body=%s", snippet)
+	if len(parsed.Outputs) == 0 {
+		return nil, fmt.Errorf("OVMS response has empty outputs")
 	}
-
-	var hidden3d []interface{}
-	switch v := rawOutputs.(type) {
-	case map[string]interface{}:
-		named, ok := v["last_hidden_state"]
-		if !ok {
-			// 若模型输出名不同，取第一个 value
-			for _, val := range v {
-				named = val
-				break
-			}
-		}
-		arr, ok := named.([]interface{})
-		if !ok {
-			return nil, fmt.Errorf("outputs.last_hidden_state is not an array")
-		}
-		hidden3d = arr
-	case []interface{}:
-		hidden3d = v
-	default:
-		return nil, fmt.Errorf("outputs is neither map nor array (%T)", v)
+	// 单输出模型：优先取 last_hidden_state，兜底取第一个键。
+	if h, ok := parsed.Outputs["last_hidden_state"]; ok {
+		return h, nil
 	}
-
-	return parseNestedHidden(hidden3d)
-}
-
-// parseNestedHidden 把 [][][]float64（JSON any 表示）转成 [batch][seq][dim]float32。
-func parseNestedHidden(raw []interface{}) ([][][]float32, error) {
-	batch := len(raw)
-	result := make([][][]float32, batch)
-	for b := 0; b < batch; b++ {
-		seqArr, ok := raw[b].([]interface{})
-		if !ok {
-			return nil, fmt.Errorf("hidden[%d] is not array", b)
-		}
-		seq := len(seqArr)
-		result[b] = make([][]float32, seq)
-		for s := 0; s < seq; s++ {
-			dimArr, ok := seqArr[s].([]interface{})
-			if !ok {
-				return nil, fmt.Errorf("hidden[%d][%d] is not array", b, s)
-			}
-			dim := len(dimArr)
-			result[b][s] = make([]float32, dim)
-			for d := 0; d < dim; d++ {
-				f, ok := dimArr[d].(float64)
-				if !ok {
-					return nil, fmt.Errorf("hidden[%d][%d][%d] is not number", b, s, d)
-				}
-				result[b][s][d] = float32(f)
-			}
-		}
+	for _, h := range parsed.Outputs {
+		return h, nil
 	}
-	return result, nil
+	return nil, fmt.Errorf("unreachable")
 }
 
 func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
@@ -276,12 +237,9 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 				ids = ids[:MaxLength]
 			}
 
-			inputIDs := make([][]int64, MaxBatch)
-			attentionMask := make([][]int64, MaxBatch)
-			tokenTypeIDs := make([][]int64, MaxBatch)
-			inputIDs[0] = make([]int64, MaxLength)
-			attentionMask[0] = make([]int64, MaxLength)
-			tokenTypeIDs[0] = make([]int64, MaxLength)
+			inputIDs := [][]int64{make([]int64, MaxLength)}
+			attentionMask := [][]int64{make([]int64, MaxLength)}
+			tokenTypeIDs := [][]int64{zeroTypeIDs} // 只读共享，节省 512×int64 分配
 			for j, id := range ids {
 				inputIDs[0][j] = int64(id)
 				attentionMask[0][j] = 1
@@ -353,6 +311,7 @@ func main() {
 		log.Fatalf("Failed: %v", err)
 	}
 	defer tk.Close()
+	zeroTypeIDs = make([]int64, MaxLength)
 	log.Println("Tokenizer ready.")
 
 	http.HandleFunc("/v1/embeddings", handleEmbeddings)
