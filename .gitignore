@@ -1,7 +1,6 @@
 # Build artifacts
 *.exe
 libtokenizers.a
-go.sum
 
 # Local Go build cache
 /tokenizers-src/

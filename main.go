@@ -1,40 +1,45 @@
 package main
 
 import (
-	"bytes"
+	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
 	"sync"
 	"time"
 
+	grpc_client "ovms-adapter/grpc-client"
+
 	"github.com/daulet/tokenizers"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
-	OVMSBaseURL   = "http://127.0.0.1:9001"
+	OVMSGRPCAddr  = "127.0.0.1:9000"
 	ModelName     = "bge-base-zh-int8"
 	APIModelID    = "bge-base-zh-int8"
 	MaxLength     = 512
 	MaxBatch      = 1 // 模型固化 shape=[1,512]，单条推理；多条请求并发发起
-	MaxParallel   = 4 // 并发调用 OVMS 的最大 goroutine 数，应 <= config.json 里的 nireq
+	MaxParallel   = 4 // 适配器全局最大并发，应 <= config.json 里的 nireq
 	ListenAddr    = "0.0.0.0:8000"
 	TokenizerPath = `E:\R\AI\ovms\models\bge-base-zh-int8\1\tokenizer.json`
 	Device        = "NPU"
 )
 
-// httpClient 复用 TCP 连接，避免每次 request 都握手；并发场景下必开。
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConns:        64,
-		MaxIdleConnsPerHost: 64,
-		IdleConnTimeout:     90 * time.Second,
-	},
-}
+var (
+	tk         *tokenizers.Tokenizer
+	grpcConn   *grpc.ClientConn
+	grpcClient grpc_client.GRPCInferenceServiceClient
+	inferSem   chan struct{}
+)
+
+// zeroTypeIDs 是所有请求共享的 token_type_ids（BGE 单句场景永远全 0）。
+// 只读，goroutine 安全；protobuf 序列化不会修改它。
+var zeroTypeIDs []int64
 
 type EmbeddingRequest struct {
 	Input interface{} `json:"input"`
@@ -59,58 +64,6 @@ type EmbeddingResponse struct {
 	Usage  Usage           `json:"usage"`
 }
 
-// TFS columnar inputs: {"inputs": {"<name>": [[...]] , ...}}
-// 每个字段值是 [batch][seq] int64 二维数组，OVMS 不再在外面加 batch 维。
-type OVMSRequest struct {
-	Inputs map[string][][]int64 `json:"inputs"`
-}
-
-// OVMS TFS 响应：单输出场景就是 map[输出名] -> [batch][seq][dim] float32。
-// 静态类型 unmarshal 避免 map[string]interface{} 的 39 万次装箱。
-type ovmsResponse struct {
-	Outputs map[string][][][]float32 `json:"outputs"`
-}
-
-var tk *tokenizers.Tokenizer
-
-// zeroTypeIDs 是所有请求共享的 token_type_ids（BGE 单句场景永远全 0）。
-// 只读，goroutine 安全；JSON 序列化不会修改它。
-var zeroTypeIDs []int64
-
-func meanPooling(hidden [][][]float32, mask [][]int64) [][]float32 {
-	batch := len(hidden)
-	if batch == 0 {
-		return nil
-	}
-	seq := len(hidden[0])
-	dim := len(hidden[0][0])
-	result := make([][]float32, batch)
-	for b := 0; b < batch; b++ {
-		result[b] = make([]float32, dim)
-		var count float32 = 0
-		mb := mask[b]
-		hb := hidden[b]
-		// mask 布局固定为前 K 个 1 后面全 0，遇到 0 直接跳出，避免扫完 512。
-		for s := 0; s < seq; s++ {
-			if s >= len(mb) || mb[s] == 0 {
-				break
-			}
-			count++
-			hs := hb[s]
-			for d := 0; d < dim; d++ {
-				result[b][d] += hs[d]
-			}
-		}
-		if count > 0 {
-			inv := 1.0 / count
-			for d := 0; d < dim; d++ {
-				result[b][d] *= inv
-			}
-		}
-	}
-	return result
-}
-
 func l2Normalize(vectors [][]float32) [][]float64 {
 	result := make([][]float64, len(vectors))
 	for i, vec := range vectors {
@@ -130,56 +83,103 @@ func l2Normalize(vectors [][]float32) [][]float64 {
 	return result
 }
 
-func callOVMS(inputIDs, attentionMask, tokenTypeIDs [][]int64) ([][][]float32, error) {
-	if len(inputIDs) == 0 {
-		return nil, fmt.Errorf("batch is 0")
+func meanPoolRaw(raw []byte, mask []int64, seq, dim int) ([]float32, error) {
+	want := seq * dim * 4
+	if len(raw) != want {
+		return nil, fmt.Errorf("unexpected OVMS output size: got %d, want %d", len(raw), want)
+	}
+	result := make([]float32, dim)
+	count := 0
+	for s := 0; s < seq && s < len(mask); s++ {
+		if mask[s] == 0 {
+			break
+		}
+		count++
+		row := raw[s*dim*4:]
+		for d := 0; d < dim; d++ {
+			bits := binary.LittleEndian.Uint32(row[d*4 : d*4+4])
+			result[d] += math.Float32frombits(bits)
+		}
+	}
+	if count == 0 {
+		return result, nil
+	}
+	inv := float32(1) / float32(count)
+	for d := range result {
+		result[d] *= inv
+	}
+	return result, nil
+}
+
+func callOVMS(parent context.Context, inputIDs, attentionMask, tokenTypeIDs [][]int64) ([]float32, error) {
+	if len(inputIDs) != MaxBatch {
+		return nil, fmt.Errorf("invalid batch: got %d, want %d", len(inputIDs), MaxBatch)
+	}
+	flat := func(values [][]int64) []int64 {
+		result := make([]int64, 0, MaxBatch*MaxLength)
+		for _, row := range values {
+			result = append(result, row...)
+		}
+		return result
 	}
 
-	payload := OVMSRequest{
-		Inputs: map[string][][]int64{
-			"input_ids":      inputIDs,
-			"attention_mask": attentionMask,
-			"token_type_ids": tokenTypeIDs,
+	request := &grpc_client.ModelInferRequest{
+		ModelName: ModelName,
+		Inputs: []*grpc_client.ModelInferRequest_InferInputTensor{
+			{
+				Name: "input_ids", Datatype: "INT64", Shape: []int64{MaxBatch, MaxLength},
+				Contents: &grpc_client.InferTensorContents{Int64Contents: flat(inputIDs)},
+			},
+			{
+				Name: "attention_mask", Datatype: "INT64", Shape: []int64{MaxBatch, MaxLength},
+				Contents: &grpc_client.InferTensorContents{Int64Contents: flat(attentionMask)},
+			},
+			{
+				Name: "token_type_ids", Datatype: "INT64", Shape: []int64{MaxBatch, MaxLength},
+				Contents: &grpc_client.InferTensorContents{Int64Contents: flat(tokenTypeIDs)},
+			},
 		},
 	}
 
-	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/v1/models/%s:predict", OVMSBaseURL, ModelName)
-
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	response, err := grpcClient.ModelInfer(ctx, request)
 	if err != nil {
-		return nil, fmt.Errorf("OVMS call failed: %v", err)
+		return nil, fmt.Errorf("OVMS gRPC call failed: %v", err)
 	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		snippet := string(respBody)
-		if len(snippet) > 512 {
-			snippet = snippet[:512] + "...(truncated)"
+	if len(response.Outputs) == 0 {
+		return nil, fmt.Errorf("OVMS gRPC response has no outputs")
+	}
+	output := response.Outputs[0]
+	if output.Name != "last_hidden_state" {
+		return nil, fmt.Errorf("unexpected OVMS output: %s", output.Name)
+	}
+	if len(output.Shape) != 3 || output.Shape[0] != int64(MaxBatch) || output.Shape[1] != int64(MaxLength) {
+		return nil, fmt.Errorf("unexpected OVMS output shape: %v", output.Shape)
+	}
+	dim := int(output.Shape[2])
+	if len(response.RawOutputContents) > 0 {
+		return meanPoolRaw(response.RawOutputContents[0], attentionMask[0], MaxLength, dim)
+	}
+	if output.Contents != nil && len(output.Contents.Fp32Contents) > 0 {
+		values := output.Contents.Fp32Contents
+		if len(values) != MaxBatch*MaxLength*dim {
+			return nil, fmt.Errorf("unexpected FP32 output count: %d", len(values))
 		}
-		return nil, fmt.Errorf("OVMS %s returned HTTP %d: %s", url, resp.StatusCode, snippet)
-	}
-
-	var parsed ovmsResponse
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		snippet := string(respBody)
-		if len(snippet) > 512 {
-			snippet = snippet[:512] + "...(truncated)"
+		result := make([]float32, dim)
+		count := 0
+		for s := 0; s < MaxLength && attentionMask[0][s] != 0; s++ {
+			count++
+			for d := 0; d < dim; d++ {
+				result[d] += values[s*dim+d]
+			}
 		}
-		return nil, fmt.Errorf("OVMS response not JSON: %v; body=%s", err, snippet)
+		for d := range result {
+			result[d] /= float32(count)
+		}
+		return result, nil
 	}
-	if len(parsed.Outputs) == 0 {
-		return nil, fmt.Errorf("OVMS response has empty outputs")
-	}
-	// 单输出模型：优先取 last_hidden_state，兜底取第一个键。
-	if h, ok := parsed.Outputs["last_hidden_state"]; ok {
-		return h, nil
-	}
-	for _, h := range parsed.Outputs {
-		return h, nil
-	}
-	return nil, fmt.Errorf("unreachable")
+	return nil, fmt.Errorf("OVMS gRPC response has no raw or FP32 output contents")
 }
 
 func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
@@ -219,14 +219,11 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	tokenCounts := make([]int, N)
 	errs := make([]error, N)
 
-	sem := make(chan struct{}, MaxParallel)
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(idx int, text string) {
 			defer wg.Done()
-			defer func() { <-sem }()
 
 			ids, _, err := tk.EncodeErr(text, true)
 			if err != nil {
@@ -246,14 +243,20 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			}
 			tokenCounts[idx] = len(ids)
 
-			lastHidden, err := callOVMS(inputIDs, attentionMask, tokenTypeIDs)
+			select {
+			case inferSem <- struct{}{}:
+			case <-r.Context().Done():
+				errs[idx] = r.Context().Err()
+				return
+			}
+			pooled, err := callOVMS(r.Context(), inputIDs, attentionMask, tokenTypeIDs)
+			<-inferSem
 			if err != nil {
 				errs[idx] = err
 				return
 			}
 
-			pooled := meanPooling(lastHidden, attentionMask)
-			emb := l2Normalize(pooled)[0]
+			emb := l2Normalize([][]float32{pooled})[0]
 			data[idx] = EmbeddingData{Object: "embedding", Embedding: emb, Index: idx}
 		}(i, texts[i])
 	}
@@ -284,12 +287,37 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func modelReady(ctx context.Context) error {
+	response, err := grpcClient.ModelReady(ctx, &grpc_client.ModelReadyRequest{Name: ModelName})
+	if err != nil {
+		return err
+	}
+	if !response.Ready {
+		return fmt.Errorf("model %s is not ready", ModelName)
+	}
+	return nil
+}
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := modelReady(ctx); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "unavailable",
+			"device": Device,
+			"model":  APIModelID,
+			"error":  err.Error(),
+		})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "ok",
-		"device": Device,
-		"model":  APIModelID,
+		"status":  "ok",
+		"device":  Device,
+		"model":   APIModelID,
+		"backend": "grpc",
 	})
 }
 
@@ -312,7 +340,19 @@ func main() {
 	}
 	defer tk.Close()
 	zeroTypeIDs = make([]int64, MaxLength)
-	log.Println("Tokenizer ready.")
+	inferSem = make(chan struct{}, MaxParallel)
+	grpcConn, err = grpc.Dial(OVMSGRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Failed to connect OVMS gRPC at %s: %v", OVMSGRPCAddr, err)
+	}
+	defer grpcConn.Close()
+	grpcClient = grpc_client.NewGRPCInferenceServiceClient(grpcConn)
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer readyCancel()
+	if err := modelReady(readyCtx); err != nil {
+		log.Fatalf("OVMS gRPC model readiness failed: %v", err)
+	}
+	log.Printf("Tokenizer ready; OVMS gRPC=%s; parallel=%d", OVMSGRPCAddr, MaxParallel)
 
 	http.HandleFunc("/v1/embeddings", handleEmbeddings)
 	http.HandleFunc("/health", handleHealth)

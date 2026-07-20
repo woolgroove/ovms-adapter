@@ -35,20 +35,15 @@ jobs:
         Copy-Item target/x86_64-pc-windows-gnu/release/libtokenizers_ffi.a "$env:GITHUB_WORKSPACE/libtokenizers.a"
         Pop-Location
 
-    - name: Init Go module
-      run: go mod init ovms-adapter
+    - name: Download Go dependencies
+      run: go mod download
 
-    - name: Install daulet/tokenizers
-      run: |
-        $env:CGO_ENABLED = "1"
-        $env:CC = "gcc"
-        go get github.com/daulet/tokenizers@v1.27.0
-
-    - name: Build
+    - name: Build and test
       run: |
         $env:CGO_ENABLED = "1"
         $env:CC = "gcc"
         $env:CGO_LDFLAGS = "-L$env:GITHUB_WORKSPACE -static -static-libgcc -static-libstdc++ -lntdll -lws2_32 -luserenv -lbcrypt -ladvapi32 -lsynchronization -lkernel32"
+        go test ./...
         go build -v -o ovms-adapter.exe .
 
     - name: Upload artifact
