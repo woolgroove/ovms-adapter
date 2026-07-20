@@ -127,15 +127,15 @@ func callOVMS(parent context.Context, inputIDs, attentionMask, tokenTypeIDs [][]
 		ModelName: ModelName,
 		Inputs: []*grpc_client.ModelInferRequest_InferInputTensor{
 			{
-				Name: "input_ids", Datatype: "INT64", Shape: []int64{MaxBatch, MaxLength},
+				Name: "input_ids", Datatype: "INT64", Shape: []int64{int64(MaxBatch), int64(MaxLength)},
 				Contents: &grpc_client.InferTensorContents{Int64Contents: flat(inputIDs)},
 			},
 			{
-				Name: "attention_mask", Datatype: "INT64", Shape: []int64{MaxBatch, MaxLength},
+				Name: "attention_mask", Datatype: "INT64", Shape: []int64{int64(MaxBatch), int64(MaxLength)},
 				Contents: &grpc_client.InferTensorContents{Int64Contents: flat(attentionMask)},
 			},
 			{
-				Name: "token_type_ids", Datatype: "INT64", Shape: []int64{MaxBatch, MaxLength},
+				Name: "token_type_ids", Datatype: "INT64", Shape: []int64{int64(MaxBatch), int64(MaxLength)},
 				Contents: &grpc_client.InferTensorContents{Int64Contents: flat(tokenTypeIDs)},
 			},
 		},
