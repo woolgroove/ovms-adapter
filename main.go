@@ -25,7 +25,7 @@ var (
 	MaxLength     = 512
 	MaxBatch      = 1 // 模型固化 shape=[1,512]，单条推理；多条请求并发发起
 	MaxParallel   = 4 // 适配器全局最大并发，应 <= config.json 里的 nireq
-	ListenAddr    = "0.0.0.0:8000"
+	ListenAddr    = "0.0.0.0:8010"
 	TokenizerPath = `E:\R\AI\ovms\models\bge-base-zh-int8\1\tokenizer.json`
 	Device        = "NPU"
 )
